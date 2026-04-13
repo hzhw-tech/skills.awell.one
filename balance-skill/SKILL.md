@@ -14,31 +14,108 @@ Base URL：`https://balance.awell.one`
 
 ### 1.1 登录（会话开始时执行）
 
-用户提供邮箱和密码后立即登录：
+用户提供邮箱和密码后需要完成**两步登录流程**：
+
+**步骤1：邮箱密码登录**
 
 ```bash
-curl -s -c /tmp/balance_cookies.txt -X POST https://balance.awell.one/api/auth/sign-in/email \
+# 登录并保存临时 cookies
+curl -s -D /tmp/balance_headers.txt -c /tmp/balance_cookies_temp.txt -X POST https://balance.awell.one/api/auth/sign-in/email \
   -H "Content-Type: application/json" \
   -d '{"email":"<EMAIL>","password":"<PASSWORD>"}'
 ```
 
-登录成功后所有请求带上 `-b /tmp/balance_cookies.txt`。
+**步骤2：获取最终的 balance_session cookie**
+
+登录成功后，**必须使用临时 cookie 请求 callback 接口**以获取最终的 `balance_session`：
+
+```bash
+# 使用临时 cookie 请求 callback，获取最终的 balance_session
+curl -s -D /tmp/balance_headers_final.txt -b /tmp/balance_cookies_temp.txt -c /tmp/balance_cookies.txt \
+  "https://balance.awell.one/auth/callback?locale=zh&returnTo=%2Fdashboard"
+```
+
+**登录成功后的处理：**
+
+1. 第一步登录会在响应头的 `set-cookie` 中返回临时认证 cookie
+2. 第二步 callback 会返回最终的 `balance_session` cookie，保存到 `/tmp/balance_cookies.txt`
+3. **后续所有请求必须使用最终的 cookie 文件 `-b /tmp/balance_cookies.txt`**
+
+```bash
+# 后续请求示例：
+curl -s -b /tmp/balance_cookies.txt https://balance.awell.one/api/books
+```
+
+**完整登录脚本示例：**
+
+```bash
+# 步骤1：邮箱密码登录
+curl -s -D /tmp/balance_headers.txt -c /tmp/balance_cookies_temp.txt -X POST https://balance.awell.one/api/auth/sign-in/email \
+  -H "Content-Type: application/json" \
+  -d '{"email":"<EMAIL>","password":"<PASSWORD>"}'
+
+# 步骤2：获取最终 balance_session
+curl -s -D /tmp/balance_headers_final.txt -b /tmp/balance_cookies_temp.txt -c /tmp/balance_cookies.txt \
+  "https://balance.awell.one/auth/callback?locale=zh&returnTo=%2Fdashboard"
+
+# 验证登录是否成功
+curl -s -b /tmp/balance_cookies.txt https://balance.awell.one/api/auth/get-session
+```
 
 ### 1.2 检查会话
 
-收到 401 时，或用户明确说"刷新登录"时：
+在以下情况需要检查会话有效性：
 
 ```bash
 curl -s -b /tmp/balance_cookies.txt https://balance.awell.one/api/auth/get-session
 ```
 
-返回 `{"session":null}` 或 401 → 重新执行 1.1 登录。
+- 返回 `{"session":null}` → 会话已失效
+- 返回 `401 Unauthorized` → 会话已失效
+- 返回有效的用户信息 → 会话正常
 
-### 1.3 会话刷新时机
+### 1.3 自动重新登录机制
 
-- 任何接口返回 401
+**触发条件：**
+- **任何接口返回 `401 Unauthorized` 状态码**
 - 用户主动说"重新登录"、"刷新登录"
-- 本次对话已累计超过 1 小时（主动提醒用户确认是否需要刷新）
+- `get-session` 接口返回 `{"session":null}`
+
+**处理流程：**
+
+1. 检测到 401 后，立即提示用户"登录已失效，正在重新登录..."
+2. 使用上次保存的邮箱密码重新执行 1.1 登录
+3. 登录成功后，重试刚才失败的操作
+4. 如果重新登录也失败，提示用户检查账号密码
+
+**示例处理代码逻辑：**
+
+```bash
+# 调用 API
+response=$(curl -s -w "\n%{http_code}" -b /tmp/balance_cookies.txt https://balance.awell.one/api/books)
+http_code=$(echo "$response" | tail -n1)
+body=$(echo "$response" | sed '$d')
+
+# 检查状态码
+if [ "$http_code" = "401" ]; then
+  echo "检测到 401，重新登录中..."
+  # 步骤1：重新登录
+  curl -s -D /tmp/balance_headers.txt -c /tmp/balance_cookies_temp.txt -X POST https://balance.awell.one/api/auth/sign-in/email \
+    -H "Content-Type: application/json" \
+    -d '{"email":"<EMAIL>","password":"<PASSWORD>"}'
+  # 步骤2：获取最终 balance_session
+  curl -s -D /tmp/balance_headers_final.txt -b /tmp/balance_cookies_temp.txt -c /tmp/balance_cookies.txt \
+    "https://balance.awell.one/auth/callback?locale=zh&returnTo=%2Fdashboard"
+  # 重试原请求
+  curl -s -b /tmp/balance_cookies.txt https://balance.awell.one/api/books
+fi
+```
+
+### 1.4 Cookie 持久化注意事项
+
+- Cookie 文件 `/tmp/balance_cookies.txt` 在系统重启后会消失，需重新登录
+- 每次会话开始时，如果 cookie 文件不存在或已过期，需要先执行登录
+- 建议在每次 skill 启动时，先检查会话有效性（调用 `get-session`）
 
 ---
 
@@ -211,8 +288,26 @@ curl -s -b /tmp/balance_cookies.txt -X DELETE https://balance.awell.one/api/entr
 
 ## 六、注意事项
 
+### 6.1 数据格式
 - `amount` 字段为**字符串**，传 `"38.50"` 而非数字 `38.50`
+- `occurredAt` 使用 ISO 8601 格式：`2026-04-14T10:30:00.000Z`
+
+### 6.2 默认行为
 - 未指定账本时默认用 `isDefault: true` 的账本
 - 分类匹配失败时告知用户并提供最近似选项，不要自行创建新分类（除非用户明确要求）
+
+### 6.3 错误处理与重试
+- **所有 API 调用都必须检查返回的 HTTP 状态码**
+- **遇到 401 立即触发重新登录，然后重试原操作**
+- 遇到其他错误码（400/403/404/500 等）应向用户报告具体错误信息
+- 登录失败时不要无限重试，最多重试 1 次，失败后提示用户检查账号密码
+
+### 6.4 用户体验
 - 操作成功后以自然语言回复，不要直接把 JSON 响应堆给用户
+- 记录流水前向用户复述确认信息
+- 删除操作前必须确认
+
+### 6.5 会话管理
 - Cookie 文件 `/tmp/balance_cookies.txt` 在系统重启后会消失，需重新登录
+- 建议在 skill 启动时先调用 `get-session` 检查会话有效性
+- 如果用户长时间未操作（超过 1 小时），主动提醒可能需要重新登录
