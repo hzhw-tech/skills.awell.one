@@ -1,313 +1,364 @@
 ---
 name: balance-skill
-description: 通过对话帮用户操作 Awell Balance 记账软件。用于记录收支流水、查询账单、管理账本和分类。当用户说"记一笔"、"今天花了"、"查一下账单"、"新建账本"等记账相关意图时使用。所有操作通过 curl 调用 https://balance.awell.one API 完成。
+description: 通过对话帮用户操作 「宜记」 记账软件。用于记录收支流水、查询账单、管理账本和分类。当用户说“记一笔”、“今天花了”、“查一下账单”、“新建账本”等记账相关意图时使用。支持多个 agent 共享同一 skill，并为多个用户分别保存登录凭证；执行任何记账或查询前先解析要使用的身份 account-id，再通过脚本读取对应 cookie 调用 https://balance.awell.one API。
 ---
 
 # Balance 记账助手
 
-Base URL：`https://balance.awell.one`
-认证方式：Cookie（`balance_session`），存储在 `/tmp/balance_cookies.txt`
+Base URL: `https://balance.awell.one`
 
----
+所有认证都通过 [`scripts/auth.sh`](./scripts/auth.sh) 完成。不要再把 cookie 或登录态写到 `/tmp`。
 
-## 一、认证
+本 skill 的本地凭证目录固定为：
 
-### 1.1 登录（会话开始时执行）
-
-用户提供邮箱和密码后需要完成**两步登录流程**：
-
-**步骤1：邮箱密码登录**
-
-```bash
-# 登录并保存临时 cookies
-curl -s -D /tmp/balance_headers.txt -c /tmp/balance_cookies_temp.txt -X POST https://balance.awell.one/api/auth/sign-in/email \
-  -H "Content-Type: application/json" \
-  -d '{"email":"<EMAIL>","password":"<PASSWORD>"}'
+```text
+balance-skill/.credentials/
+  current_account.txt
+  <account-id>/
+    credentials.json
+    profile.json
+    cookies.txt
 ```
 
-**步骤2：获取最终的 balance_session cookie**
+`account-id` 是给 agent 使用的身份标识，例如 `personal`、`work`、`alice-home`。它不一定等于邮箱。
 
-登录成功后，**必须使用临时 cookie 请求 callback 接口**以获取最终的 `balance_session`：
+## 一、身份解析
+
+在任何 API 操作前，先确定“这笔操作要使用哪个身份”：
+
+1. 如果用户明确指定了身份、账号、邮箱或别名，优先用那个身份。
+2. 如果用户没指定，但当前只有一个已登录身份，可以直接使用它。
+3. 如果用户没指定，且存在多个身份：
+   - 如果语境能明确映射到某个身份，就直接使用那个身份。
+   - 如果仍然不明确，先问用户“这笔要记到哪个身份？”
+4. 如果当前没有可用身份，先引导用户执行登录。
+
+默认身份只用于“没有歧义”的情况。不要在多身份并存时擅自替用户选人。
+
+## 二、认证
+
+### 2.1 首次登录或新增身份
+
+使用固定脚本登录，并把完整登录信息保存到 skill 目录内：
 
 ```bash
-# 使用临时 cookie 请求 callback，获取最终的 balance_session
-curl -s -D /tmp/balance_headers_final.txt -b /tmp/balance_cookies_temp.txt -c /tmp/balance_cookies.txt \
-  "https://balance.awell.one/auth/callback?locale=zh&returnTo=%2Fdashboard"
+./balance-skill/scripts/auth.sh login <account-id> <email> <password>
 ```
 
-**登录成功后的处理：**
-
-1. 第一步登录会在响应头的 `set-cookie` 中返回临时认证 cookie
-2. 第二步 callback 会返回最终的 `balance_session` cookie，保存到 `/tmp/balance_cookies.txt`
-3. **后续所有请求必须使用最终的 cookie 文件 `-b /tmp/balance_cookies.txt`**
+示例：
 
 ```bash
-# 后续请求示例：
-curl -s -b /tmp/balance_cookies.txt https://balance.awell.one/api/books
+./balance-skill/scripts/auth.sh login personal alice@example.com 'mypassword'
+./balance-skill/scripts/auth.sh login work alice@company.com 'mypassword'
 ```
 
-**完整登录脚本示例：**
+脚本会：
+
+1. 调用邮箱密码登录接口。
+2. 调用 callback 接口拿到最终 `balance_session`。
+3. 把 `credentials.json`、`profile.json`、`cookies.txt` 保存在 `balance-skill/.credentials/<account-id>/` 下。
+4. 把该身份写入 `current_account.txt`，作为当前激活身份。
+
+### 2.2 查看和切换身份
 
 ```bash
-# 步骤1：邮箱密码登录
-curl -s -D /tmp/balance_headers.txt -c /tmp/balance_cookies_temp.txt -X POST https://balance.awell.one/api/auth/sign-in/email \
-  -H "Content-Type: application/json" \
-  -d '{"email":"<EMAIL>","password":"<PASSWORD>"}'
-
-# 步骤2：获取最终 balance_session
-curl -s -D /tmp/balance_headers_final.txt -b /tmp/balance_cookies_temp.txt -c /tmp/balance_cookies.txt \
-  "https://balance.awell.one/auth/callback?locale=zh&returnTo=%2Fdashboard"
-
-# 验证登录是否成功
-curl -s -b /tmp/balance_cookies.txt https://balance.awell.one/api/auth/get-session
+./balance-skill/scripts/auth.sh current
+./balance-skill/scripts/auth.sh current --json
+./balance-skill/scripts/auth.sh list
+./balance-skill/scripts/auth.sh list --json
+./balance-skill/scripts/auth.sh switch <account-id>
 ```
 
-### 1.2 检查会话
+优先使用 `--json` 版本给 agent 读。
 
-在以下情况需要检查会话有效性：
+### 2.3 获取 cookie 路径
+
+所有后续 API 都应先通过脚本拿 cookie 路径，而不是手写路径：
 
 ```bash
-curl -s -b /tmp/balance_cookies.txt https://balance.awell.one/api/auth/get-session
+COOKIE_FILE="$(./balance-skill/scripts/auth.sh cookie-path <account-id>)"
 ```
 
-- 返回 `{"session":null}` → 会话已失效
-- 返回 `401 Unauthorized` → 会话已失效
-- 返回有效的用户信息 → 会话正常
-
-### 1.3 自动重新登录机制
-
-**触发条件：**
-- **任何接口返回 `401 Unauthorized` 状态码**
-- 用户主动说"重新登录"、"刷新登录"
-- `get-session` 接口返回 `{"session":null}`
-
-**处理流程：**
-
-1. 检测到 401 后，立即提示用户"登录已失效，正在重新登录..."
-2. 使用上次保存的邮箱密码重新执行 1.1 登录
-3. 登录成功后，重试刚才失败的操作
-4. 如果重新登录也失败，提示用户检查账号密码
-
-**示例处理代码逻辑：**
+如果省略 `account-id`，脚本会使用当前激活身份：
 
 ```bash
-# 调用 API
-response=$(curl -s -w "\n%{http_code}" -b /tmp/balance_cookies.txt https://balance.awell.one/api/books)
+COOKIE_FILE="$(./balance-skill/scripts/auth.sh cookie-path)"
+```
+
+### 2.4 检查会话
+
+优先用脚本检查：
+
+```bash
+./balance-skill/scripts/auth.sh session <account-id>
+```
+
+或直接调接口：
+
+```bash
+COOKIE_FILE="$(./balance-skill/scripts/auth.sh cookie-path <account-id>)"
+curl -s -b "$COOKIE_FILE" https://balance.awell.one/api/auth/get-session
+```
+
+判定规则：
+
+- 返回 `{"session":null}`: 会话已失效
+- 返回 `401 Unauthorized`: 会话已失效
+- 返回有效用户信息: 会话正常
+
+### 2.5 自动重新登录
+
+触发条件：
+
+- 任意业务接口返回 `401`
+- `get-session` 返回 `{"session":null}`
+- 用户主动要求“重新登录”“刷新登录”
+
+处理流程：
+
+1. 告知用户当前身份的登录态已失效。
+2. 执行：
+
+```bash
+./balance-skill/scripts/auth.sh relogin <account-id>
+```
+
+3. 脚本会读取 `balance-skill/.credentials/<account-id>/credentials.json` 中保存的邮箱和密码，重新换取新的 cookie。
+4. 重新执行刚才失败的 API 请求。
+5. 如果 `relogin` 失败，再让用户重新提供账号密码。
+
+注意：`credentials.json` 中存有明文密码，只能保存在本机 skill 目录中，且不得输出给用户或写入日志。
+
+## 三、API 调用约定
+
+每次调用前先准备：
+
+```bash
+ACCOUNT_ID="<account-id>"
+COOKIE_FILE="$(./balance-skill/scripts/auth.sh cookie-path "$ACCOUNT_ID")"
+```
+
+所有请求都必须检查 HTTP 状态码。推荐模式：
+
+```bash
+response=$(curl -s -w "\n%{http_code}" -b "$COOKIE_FILE" https://balance.awell.one/api/books)
 http_code=$(echo "$response" | tail -n1)
 body=$(echo "$response" | sed '$d')
 
-# 检查状态码
 if [ "$http_code" = "401" ]; then
-  echo "检测到 401，重新登录中..."
-  # 步骤1：重新登录
-  curl -s -D /tmp/balance_headers.txt -c /tmp/balance_cookies_temp.txt -X POST https://balance.awell.one/api/auth/sign-in/email \
-    -H "Content-Type: application/json" \
-    -d '{"email":"<EMAIL>","password":"<PASSWORD>"}'
-  # 步骤2：获取最终 balance_session
-  curl -s -D /tmp/balance_headers_final.txt -b /tmp/balance_cookies_temp.txt -c /tmp/balance_cookies.txt \
-    "https://balance.awell.one/auth/callback?locale=zh&returnTo=%2Fdashboard"
-  # 重试原请求
-  curl -s -b /tmp/balance_cookies.txt https://balance.awell.one/api/books
+  ./balance-skill/scripts/auth.sh relogin "$ACCOUNT_ID" >/dev/null
+  COOKIE_FILE="$(./balance-skill/scripts/auth.sh cookie-path "$ACCOUNT_ID")"
+  response=$(curl -s -w "\n%{http_code}" -b "$COOKIE_FILE" https://balance.awell.one/api/books)
+  http_code=$(echo "$response" | tail -n1)
+  body=$(echo "$response" | sed '$d')
 fi
 ```
 
-### 1.4 Cookie 持久化注意事项
+## 四、账本（Books）
 
-- Cookie 文件 `/tmp/balance_cookies.txt` 在系统重启后会消失，需重新登录
-- 每次会话开始时，如果 cookie 文件不存在或已过期，需要先执行登录
-- 建议在每次 skill 启动时，先检查会话有效性（调用 `get-session`）
-
----
-
-## 二、账本（Books）
-
-### 2.1 列出账本（绝大多数操作前先调用，拿到 bookId）
+绝大多数操作前先列出账本，拿到 `bookId`：
 
 ```bash
-curl -s -b /tmp/balance_cookies.txt https://balance.awell.one/api/books
+COOKIE_FILE="$(./balance-skill/scripts/auth.sh cookie-path <account-id>)"
+curl -s -b "$COOKIE_FILE" https://balance.awell.one/api/books
 ```
 
-返回 `{ "books": [{ "id", "name", "isDefault", "isShared", "budgetAmount" }] }`
+返回：
 
-**规则：** 若用户未指定账本，优先使用 `isDefault: true` 的那个。
-
-### 2.2 获取单个账本
-
-```bash
-curl -s -b /tmp/balance_cookies.txt https://balance.awell.one/api/books/<bookId>
+```json
+{ "books": [{ "id": "...", "name": "...", "isDefault": true, "isShared": false, "budgetAmount": "..." }] }
 ```
 
-### 2.3 创建账本
+规则：若用户未指定账本，优先使用 `isDefault: true` 的账本。
+
+### 4.1 获取单个账本
 
 ```bash
-curl -s -b /tmp/balance_cookies.txt -X POST https://balance.awell.one/api/books \
+curl -s -b "$COOKIE_FILE" https://balance.awell.one/api/books/<bookId>
+```
+
+### 4.2 创建账本
+
+```bash
+curl -s -b "$COOKIE_FILE" -X POST https://balance.awell.one/api/books \
   -H "Content-Type: application/json" \
   -d '{"name":"<名称>","isShared":false,"budgetAmount":"<月预算，可选>"}'
 ```
 
-### 2.4 更新账本
+### 4.3 更新账本
 
 ```bash
-curl -s -b /tmp/balance_cookies.txt -X PATCH https://balance.awell.one/api/books/<bookId> \
+curl -s -b "$COOKIE_FILE" -X PATCH https://balance.awell.one/api/books/<bookId> \
   -H "Content-Type: application/json" \
   -d '{"name":"<新名称>","isDefault":true,"budgetAmount":"<新预算>"}'
 ```
 
-### 2.5 删除账本
+### 4.4 删除账本
 
 ```bash
-curl -s -b /tmp/balance_cookies.txt -X DELETE https://balance.awell.one/api/books/<bookId>
+curl -s -b "$COOKIE_FILE" -X DELETE https://balance.awell.one/api/books/<bookId>
 ```
 
----
-
-## 三、分类（Categories）
+## 五、分类（Categories）
 
 每条流水必须关联分类。分类有 `type: income | expense`。
 
-### 3.1 列出分类
+### 5.1 列出分类
 
 ```bash
-# 全部分类
-curl -s -b /tmp/balance_cookies.txt "https://balance.awell.one/api/categories?bookId=<bookId>"
-
-# 仅支出分类
-curl -s -b /tmp/balance_cookies.txt "https://balance.awell.one/api/categories?bookId=<bookId>&type=expense"
-
-# 仅收入分类
-curl -s -b /tmp/balance_cookies.txt "https://balance.awell.one/api/categories?bookId=<bookId>&type=income"
+curl -s -b "$COOKIE_FILE" "https://balance.awell.one/api/categories?bookId=<bookId>"
+curl -s -b "$COOKIE_FILE" "https://balance.awell.one/api/categories?bookId=<bookId>&type=expense"
+curl -s -b "$COOKIE_FILE" "https://balance.awell.one/api/categories?bookId=<bookId>&type=income"
 ```
 
-返回 `{ "categories": [{ "id", "type", "name", "icon", "color", "isArchived" }] }`
+返回：
 
-**规则：** 用户描述消费/收入时，根据语义匹配分类名称；若无完全匹配，选最近似的，并告知用户。
+```json
+{ "categories": [{ "id": "...", "type": "expense", "name": "餐饮", "icon": "🍜", "color": "#ef4444", "isArchived": false }] }
+```
 
-### 3.2 创建分类
+规则：根据用户语义匹配分类；若无完全匹配，选最近似并告知用户。
+
+### 5.2 创建分类
 
 ```bash
-curl -s -b /tmp/balance_cookies.txt -X POST https://balance.awell.one/api/categories \
+curl -s -b "$COOKIE_FILE" -X POST https://balance.awell.one/api/categories \
   -H "Content-Type: application/json" \
   -d '{"bookId":"<bookId>","type":"expense","name":"<名称>","icon":"<emoji>","color":"<hex色值>"}'
 ```
 
-`icon` 用 emoji，`color` 用 `#rrggbb` 格式，颜色根据分类语义自动选取。
-
-### 3.3 更新分类
+### 5.3 更新分类
 
 ```bash
-curl -s -b /tmp/balance_cookies.txt -X PATCH https://balance.awell.one/api/categories/<categoryId> \
+curl -s -b "$COOKIE_FILE" -X PATCH https://balance.awell.one/api/categories/<categoryId> \
   -H "Content-Type: application/json" \
   -d '{"name":"<新名称>","isArchived":false}'
 ```
 
----
+## 六、流水（Entries）
 
-## 四、流水（Entries）——核心功能
+`occurredAt` 使用 ISO 8601，例如 `2026-04-13T14:30:00.000Z`。未指定时间时，使用当前时刻。
 
-`occurredAt` 格式：ISO 8601，如 `2026-04-13T14:30:00.000Z`。未指定时间时，使用当前时刻。
+### 6.1 记一笔
 
-### 4.1 记一笔（最常用）
-
-**触发词：** "记一笔"、"花了"、"收入"、"买了"、"付了"、"赚了"等
+触发词：“记一笔”“花了”“收入”“买了”“付了”“赚了”等。
 
 流程：
 
-1. 调用 2.1 获取账本，确认 bookId
-2. 调用 3.1 获取对应类型分类，匹配 categoryId
-3. 创建流水
+1. 解析身份 `account-id`
+2. 列出账本，确定 `bookId`
+3. 列出对应类型分类，确定 `categoryId`
+4. 如果金额、类型、时间、身份、账本这些关键信息足够，就直接创建流水
+5. 只有在关键信息缺失或身份不明确时才追问用户
 
 ```bash
-curl -s -b /tmp/balance_cookies.txt -X POST https://balance.awell.one/api/entries \
+curl -s -b "$COOKIE_FILE" -X POST https://balance.awell.one/api/entries \
   -H "Content-Type: application/json" \
   -d '{
-    "bookId": "<bookId>",
-    "type": "expense",
-    "amount": "<金额字符串，如 38.50>",
-    "categoryId": "<categoryId>",
-    "occurredAt": "<ISO8601时间>",
-    "remark": "<备注，可选>"
+    "bookId":"<bookId>",
+    "type":"expense",
+    "amount":"<金额字符串，如 38.50>",
+    "categoryId":"<categoryId>",
+    "occurredAt":"<ISO8601时间>",
+    "remark":"<备注，可选>"
   }'
 ```
 
-**确认逻辑：** 记录前向用户复述"账本：xxx，类型：支出，金额：38.5，分类：餐饮，时间：今天 14:30，备注：午饭"，用户确认后再发请求。
+默认不要在记账前询问“是否确认”。应先尽量从用户原话中补全信息并直接记账。
 
-### 4.2 查询流水
+记账完成后，必须用自然语言回执，至少包含：
 
-**触发词：** "查一下"、"看看账单"、"本月花了多少"等
+- 使用的身份 `account-id`
+- 账本名称
+- 收支类型
+- 金额
+- 分类
+- 时间
+- 备注（如果有）
+- 结果状态（已记账 / 失败）
+
+回执示例：
+“已为 `personal` 记账：账本‘日常’，支出 38.5 元，分类‘餐饮’，时间今天 14:30，备注‘午饭’。”
+
+只有在以下情况才允许先问用户再记：
+
+- 无法判断要用哪个身份
+- 无法判断是收入还是支出
+- 缺少金额
+- 用户表达明显含糊，存在高概率记错的风险
+
+### 6.2 查询流水
 
 ```bash
-# 查询某账本全部流水
-curl -s -b /tmp/balance_cookies.txt "https://balance.awell.one/api/entries?bookId=<bookId>"
-
-# 按时间区间（本月）
-curl -s -b /tmp/balance_cookies.txt "https://balance.awell.one/api/entries?bookId=<bookId>&dateFrom=2026-04-01&dateTo=2026-04-30"
-
-# 按类型
-curl -s -b /tmp/balance_cookies.txt "https://balance.awell.one/api/entries?bookId=<bookId>&type=expense"
-
-# 按分类
-curl -s -b /tmp/balance_cookies.txt "https://balance.awell.one/api/entries?bookId=<bookId>&categoryId=<categoryId>"
+curl -s -b "$COOKIE_FILE" "https://balance.awell.one/api/entries?bookId=<bookId>"
+curl -s -b "$COOKIE_FILE" "https://balance.awell.one/api/entries?bookId=<bookId>&dateFrom=2026-04-01&dateTo=2026-04-30"
+curl -s -b "$COOKIE_FILE" "https://balance.awell.one/api/entries?bookId=<bookId>&type=expense"
+curl -s -b "$COOKIE_FILE" "https://balance.awell.one/api/entries?bookId=<bookId>&categoryId=<categoryId>"
 ```
 
-查询结果以表格形式展示：日期 | 类型 | 分类 | 金额 | 备注，并汇总收入/支出合计。
+输出时用自然语言或表格总结：日期 | 类型 | 分类 | 金额 | 备注，并汇总收入/支出合计。
 
-### 4.3 修改流水
+### 6.3 修改流水
 
-先通过 4.2 找到对应 entryId：
+先查询定位 `entryId`，再修改：
 
 ```bash
-curl -s -b /tmp/balance_cookies.txt -X PATCH https://balance.awell.one/api/entries/<entryId> \
+curl -s -b "$COOKIE_FILE" -X PATCH https://balance.awell.one/api/entries/<entryId> \
   -H "Content-Type: application/json" \
   -d '{"amount":"<新金额>","remark":"<新备注>"}'
 ```
 
-### 4.4 删除流水
+### 6.4 删除流水
 
 ```bash
-curl -s -b /tmp/balance_cookies.txt -X DELETE https://balance.awell.one/api/entries/<entryId>
+curl -s -b "$COOKIE_FILE" -X DELETE https://balance.awell.one/api/entries/<entryId>
 ```
 
-删除前向用户确认。
+删除前必须确认，并明确要删除的是哪个身份下的数据。
 
----
+## 七、常见对话场景
 
-## 五、常见对话场景
+| 用户说 | 操作路径 |
+| --- | --- |
+| 今天午饭花了 35 | 身份解析 → 账本 → 分类(expense) → 创建流水 |
+| 帮我记到 work 账号，晚饭 56 | 身份解析(work) → 账本 → 分类(expense) → 创建流水 |
+| 查 personal 这个月账单 | 身份解析(personal) → 账本 → 查询流水 |
+| 工资到账 8000 | 身份解析 → 账本 → 分类(income) → 创建流水 |
+| 新建一个旅行账本 | 身份解析 → 创建账本 |
+| 帮我加个健身分类 | 身份解析 → 账本 → 创建分类 |
+| 刚才那笔记错了 | 身份解析 → 查流水找 entryId → 修改 |
+| 删掉昨天那笔外卖 | 身份解析 → 查流水找 entryId → 删除 |
 
-| 用户说             | 操作路径                              |
-| ------------------ | ------------------------------------- |
-| 今天午饭花了 35    | 2.1 → 3.1(expense) → 4.1              |
-| 查本月账单         | 2.1 → 4.2(dateFrom/dateTo)            |
-| 工资到账 8000      | 2.1 → 3.1(income) → 4.1               |
-| 新建一个旅行账本   | 2.3                                   |
-| 帮我加个"健身"分类 | 2.1 → 3.2                             |
-| 刚才那笔记错了     | 4.2(找entryId) → 4.3                  |
-| 删掉昨天那笔外卖   | 4.2(找entryId) → 4.4                  |
-| 本月餐饮共花多少   | 2.1 → 3.1(找categoryId) → 4.2(按分类) |
+## 八、注意事项
 
----
+### 8.1 数据格式
 
-## 六、注意事项
+- `amount` 必须是字符串，如 `"38.50"`
+- `occurredAt` 使用 ISO 8601
 
-### 6.1 数据格式
-- `amount` 字段为**字符串**，传 `"38.50"` 而非数字 `38.50`
-- `occurredAt` 使用 ISO 8601 格式：`2026-04-14T10:30:00.000Z`
+### 8.2 默认行为
 
-### 6.2 默认行为
-- 未指定账本时默认用 `isDefault: true` 的账本
-- 分类匹配失败时告知用户并提供最近似选项，不要自行创建新分类（除非用户明确要求）
+- 未指定账本时，默认用 `isDefault: true` 的账本
+- 分类匹配失败时，提供最近似选项，不要擅自新建分类
+- 多身份并存时，身份不明确就先问，不要默认乱记
 
-### 6.3 错误处理与重试
-- **所有 API 调用都必须检查返回的 HTTP 状态码**
-- **遇到 401 立即触发重新登录，然后重试原操作**
-- 遇到其他错误码（400/403/404/500 等）应向用户报告具体错误信息
-- 登录失败时不要无限重试，最多重试 1 次，失败后提示用户检查账号密码
+### 8.3 错误处理
 
-### 6.4 用户体验
-- 操作成功后以自然语言回复，不要直接把 JSON 响应堆给用户
-- 记录流水前向用户复述确认信息
+- 所有 API 调用都必须检查 HTTP 状态码
+- 遇到 `401` 立即 `relogin`，然后只重试一次
+- 遇到 `400/403/404/500` 时，提炼错误信息再告诉用户
+- 登录失败时最多重试 1 次
+
+### 8.4 用户体验
+
+- 操作成功后用自然语言回复，不直接堆原始 JSON
+- 记录流水时默认直接执行，不做事前确认
+- 记账完成后反馈：身份、账本、类型、金额、分类、时间、备注、结果
+- 只有关键信息缺失或存在明显歧义时才追问
 - 删除操作前必须确认
 
-### 6.5 会话管理
-- Cookie 文件 `/tmp/balance_cookies.txt` 在系统重启后会消失，需重新登录
-- 建议在 skill 启动时先调用 `get-session` 检查会话有效性
-- 如果用户长时间未操作（超过 1 小时），主动提醒可能需要重新登录
+### 8.5 凭证安全
+
+- 凭证只保存在 `balance-skill/.credentials/` 下，不使用 `/tmp`
+- `credentials.json` 含明文密码，只允许本地脚本读取
+- 不要把密码、cookie 内容或完整 session 回显给用户

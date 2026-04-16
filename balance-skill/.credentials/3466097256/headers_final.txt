@@ -1,0 +1,12 @@
+HTTP/2 307 
+date: Thu, 16 Apr 2026 12:47:50 GMT
+location: https://balance.awell.one/dashboard
+set-cookie: balance_session=J0I8K_iMzzi63inj-5w_BR04sK500PCD6bVS1pHW; Path=/; Expires=Thu, 30 Apr 2026 12:47:50 GMT; Secure; HttpOnly; SameSite=lax
+vary: rsc, next-router-state-tree, next-router-prefetch, next-router-segment-prefetch
+x-opennext: 1
+report-to: {"group":"cf-nel","max_age":604800,"endpoints":[{"url":"https://a.nel.cloudflare.com/report/v4?s=Lk%2B4V8%2BHf9ksfj%2FNfd0A862ldal6HG78SwEKlqyfzk%2BgkzN09RtLVr8%2FIEiQrfeK7s8%2F5BjMOjFx7viA120bWpyH%2BlXy4VaP1JdoyAKAr3C7tVsZnLyVWREkUpYp42s1PndNFw%3D%3D"}]}
+nel: {"report_to":"cf-nel","success_fraction":0.0,"max_age":604800}
+server: cloudflare
+cf-ray: 9ed34d01bd3f08b3-HKG
+alt-svc: h3=":443"; ma=86400
+
